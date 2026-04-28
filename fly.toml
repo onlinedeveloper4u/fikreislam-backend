@@ -1,6 +1,6 @@
 # fly.toml app configuration file generated for fikreislam-backend
 
-app = "fikre-islam-backend-v1-aqib"
+app = "fikreislam-backend"
 primary_region = "sin"
 
 [build]
