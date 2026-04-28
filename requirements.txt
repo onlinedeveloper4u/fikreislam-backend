@@ -1,0 +1,6 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+python-multipart==0.0.20
+internetarchive==5.8.0
+python-dotenv==1.1.0
+pydantic==2.11.3
