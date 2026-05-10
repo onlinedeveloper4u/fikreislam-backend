@@ -110,12 +110,8 @@ def upload_to_ia(
         "mediatype": mediatype,
         "collection": "opensource",
         "title": title,
-        "description": f"Content from Fikr-e-Islam: {title}",
+        "creator": "فکر اسلام",
     }
-    if speaker:
-        metadata["creator"] = speaker
-    if media_type_subject:
-        metadata["subject"] = media_type_subject
 
     ia_url = ""
     download_url = ""
@@ -219,14 +215,12 @@ def update_metadata(
 
     mediatype = _resolve_mediatype(content_type)
 
-    md: dict = {"mediatype": mediatype}
+    md: dict = {
+        "mediatype": mediatype,
+        "creator": "فکر اسلام"
+    }
     if title:
         md["title"] = title
-        md["description"] = f"Content from Fikr-e-Islam: {title}"
-    if speaker:
-        md["creator"] = speaker
-    if media_type_subject:
-        md["subject"] = media_type_subject
 
     try:
         resp = ia.modify_metadata(
