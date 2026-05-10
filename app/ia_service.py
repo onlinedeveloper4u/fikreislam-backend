@@ -102,7 +102,6 @@ def upload_to_ia(
 
     Returns the same shape as the TS IAUploadResult.
     """
-    session = _get_session()
     identifier = existing_identifier or generate_identifier(speaker)
     safe_filename = sanitize_filename(original_filename)
     mediatype = _resolve_mediatype(content_type)
@@ -347,22 +346,35 @@ def delete_file(ia_url: str) -> bool:
 
 # ─── Delete entire item ─────────────────────────────────────────────────
 
+
 def delete_item(identifier: str) -> bool:
-    """Delete all files in an IA item (effectively removing the item)."""
+    """Fully remove an IA item (matches the web UI "Remove Items" button).
+
+    Submits a ``make_dark.php`` task — this is the same mechanism the
+    archive.org web UI uses to deaccession an item and remove it from
+    uploads, search results, and public listings.
+    """
     if not identifier:
         return False
 
     try:
-        ia.delete(
+        session = _get_session()
+        resp = session.submit_task(
             identifier,
-            cascade_delete=True,
-            access_key=settings.ia_access_key,
-            secret_key=settings.ia_secret_key,
+            cmd="make_dark.php",
+            comment="remove item via fikreislam backend",
         )
-        logger.info("Deleted entire item %s", identifier)
-        return True
+        if resp.status_code in (200, 201):
+            logger.info("make_dark task submitted for %s — item will be removed from uploads", identifier)
+            return True
+        else:
+            logger.warning(
+                "make_dark task returned %d for %s: %s",
+                resp.status_code, identifier, getattr(resp, 'text', '')[:300],
+            )
+            return False
     except Exception as e:
-        logger.error("Error deleting item %s: %s", identifier, e)
+        logger.error("Error submitting make_dark task for item %s: %s", identifier, e)
         return False
 
 
