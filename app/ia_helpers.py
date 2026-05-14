@@ -18,6 +18,11 @@ from app.config import settings
 logger = logging.getLogger("fikreislam-ia.helpers")
 
 IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{2,99}$")
+CONTENT_TYPE_TO_MEDIATYPE = {
+    "آڈیو": "audio",
+    "ویڈیو": "movies",
+    "book": "texts",
+}
 
 
 def get_session() -> ia.ArchiveSession:
@@ -95,6 +100,13 @@ def extract_identifier_and_filename(ia_url: str | None) -> tuple[str | None, str
     if not is_valid_identifier(identifier) or not filename:
         return None, None
     return identifier, filename
+
+
+def resolve_mediatype(content_type: str | None) -> str:
+    """Map CMS content type to IA mediatype string."""
+    if content_type and content_type in CONTENT_TYPE_TO_MEDIATYPE:
+        return CONTENT_TYPE_TO_MEDIATYPE[content_type]
+    return "audio"
 
 
 def response_text(resp: Any, limit: int = 300) -> str:

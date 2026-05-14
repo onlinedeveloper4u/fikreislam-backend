@@ -72,7 +72,7 @@ async def upload_file(
     """
     Accepts multipart form data identical to the existing Next.js API route:
       - file:               The main media file
-      - metadata:           JSON string  { title, speaker? }
+      - metadata:           JSON string  { title, speaker?, contentType? }
       - coverFile?:         Optional cover image
       - existingIdentifier?: Reuse an existing IA item
     """
@@ -137,6 +137,7 @@ async def upload_file(
                     file_path=file_path,
                     original_filename=file.filename if file else "upload",
                     title=title,
+                    content_type=meta.get("contentType"),
                     speaker=meta.get("speaker"),
                     cover_path=cover_path,
                     existing_identifier=existingIdentifier,
@@ -180,6 +181,7 @@ async def update_item_metadata(
     ok = update_metadata(
         ia_url=body.ia_url,
         title=body.title,
+        content_type=body.contentType,
     )
     if not ok:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Metadata update failed")

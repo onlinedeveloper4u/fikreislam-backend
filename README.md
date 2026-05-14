@@ -52,7 +52,7 @@ Content-Type: multipart/form-data
 
 Fields:
   file?:               Main media file (required for new items)
-  metadata:            JSON string { title, speaker? }
+  metadata:            JSON string { title, speaker?, contentType? }
   coverFile?:          Optional cover image
   existingIdentifier?: Reuse an existing IA item
 ```
@@ -65,7 +65,8 @@ Upload responses include `deriveTriggered`, optional derive task details, and
 PATCH /api/ia/metadata
 {
   "ia_url": "ia://fikreislam-speaker-abc123/file.mp3",
-  "title": "New Title"
+  "title": "New Title",
+  "contentType": "آڈیو"
 }
 ```
 

@@ -4,7 +4,7 @@ Pydantic models (request / response schemas).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -15,6 +15,7 @@ class UploadMetadata(BaseModel):
 
     title: str
     speaker: Optional[str] = None
+    contentType: Optional[Literal["آڈیو", "ویڈیو", "book"]] = "آڈیو"
 
 
 class UpdateMetadataRequest(BaseModel):
@@ -22,6 +23,7 @@ class UpdateMetadataRequest(BaseModel):
 
     ia_url: str = Field(..., description="ia:// URL or archive.org URL")
     title: Optional[str] = None
+    contentType: Optional[Literal["آڈیو", "ویڈیو", "book"]] = None
 
 
 class RenameRequest(BaseModel):

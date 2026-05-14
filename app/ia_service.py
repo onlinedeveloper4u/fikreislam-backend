@@ -22,6 +22,7 @@ from app.ia_helpers import (
     generate_identifier,
     get_session,
     is_valid_identifier,
+    resolve_mediatype,
     response_text,
     sanitize_filename,
     submit_task_with_retry,
@@ -124,6 +125,7 @@ def upload_to_ia(
     file_path: Optional[str],
     original_filename: str,
     title: str,
+    content_type: str | None = None,
     speaker: str | None = None,
     cover_path: str | None = None,
     existing_identifier: str | None = None,
@@ -143,8 +145,10 @@ def upload_to_ia(
         raise RuntimeError("Invalid Internet Archive identifier")
 
     safe_filename = sanitize_filename(original_filename)
+    mediatype = resolve_mediatype(content_type)
     warnings: list[str] = []
     metadata = {
+        "mediatype": mediatype,
         "title": title,
         "creator": "فکر اسلام",
     }
@@ -211,13 +215,16 @@ def upload_to_ia(
 def update_metadata(
     ia_url: str,
     title: str | None = None,
+    content_type: str | None = None,
 ) -> bool:
     """Update item metadata using official modify_metadata (JSON Patch)."""
     identifier = extract_identifier(ia_url)
     if not is_valid_identifier(identifier):
         return False
 
+    mediatype = resolve_mediatype(content_type)
     md: dict = {
+        "mediatype": mediatype,
         "creator": "فکر اسلام"
     }
     if title:
