@@ -4,17 +4,9 @@ Pydantic models (request / response schemas).
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
-
-
-# ── Content type mapping ─────────────────────────────────────────────────
-CONTENT_TYPE_TO_MEDIATYPE = {
-    "آڈیو": "audio",
-    "ویڈیو": "movies",
-    "book": "texts",
-}
 
 
 # ── Request models ───────────────────────────────────────────────────────
@@ -23,8 +15,6 @@ class UploadMetadata(BaseModel):
 
     title: str
     speaker: Optional[str] = None
-    media_type: Optional[str] = None          # subject tag
-    contentType: Optional[Literal["آڈیو", "ویڈیو", "book"]] = "آڈیو"
 
 
 class UpdateMetadataRequest(BaseModel):
@@ -32,9 +22,6 @@ class UpdateMetadataRequest(BaseModel):
 
     ia_url: str = Field(..., description="ia:// URL or archive.org URL")
     title: Optional[str] = None
-    speaker: Optional[str] = None
-    media_type: Optional[str] = None
-    contentType: Optional[Literal["آڈیو", "ویڈیو", "book"]] = None
 
 
 class RenameRequest(BaseModel):
@@ -48,6 +35,10 @@ class DeleteFileRequest(BaseModel):
 
 class DeleteItemRequest(BaseModel):
     identifier: str
+    confirm: bool = Field(
+        False,
+        description="Must be true to confirm IA item removal/deaccession",
+    )
 
 
 class DeriveRequest(BaseModel):
@@ -61,6 +52,10 @@ class UploadResult(BaseModel):
     iaUrl: str
     downloadUrl: str
     coverIaUrl: Optional[str] = None
+    deriveTriggered: bool = False
+    deriveTaskStatusCode: Optional[int] = None
+    deriveTaskResponse: Optional[str] = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RenameResult(BaseModel):
@@ -71,3 +66,10 @@ class RenameResult(BaseModel):
 class StatusResponse(BaseModel):
     success: bool
     message: str = ""
+    identifier: Optional[str] = None
+    fileName: Optional[str] = None
+    taskSubmitted: Optional[bool] = None
+    taskStatusCode: Optional[int] = None
+    taskResponse: Optional[str] = None
+    deriveTriggered: Optional[bool] = None
+    warnings: list[str] = Field(default_factory=list)

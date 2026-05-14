@@ -9,9 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import shutil
-import tempfile
 from typing import Optional
 
 from fastapi import (
@@ -34,6 +31,14 @@ from app.ia_service import (
     update_metadata,
     upload_to_ia,
 )
+from app.ia_helpers import is_valid_identifier
+from app.route_helpers import (
+    raise_operation_error,
+    remove_file_safely,
+    save_upload_to_temp,
+    upload_size,
+    upload_temp_dir,
+)
 from app.schemas import (
     DeleteFileRequest,
     DeleteItemRequest,
@@ -49,8 +54,6 @@ logger = logging.getLogger("fikreislam-ia.routes")
 
 ia_router = APIRouter()
 
-UPLOAD_DIR = "uploads"
-
 
 # ─── Upload ──────────────────────────────────────────────────────────────
 
@@ -60,7 +63,7 @@ UPLOAD_DIR = "uploads"
     summary="Upload a file to Internet Archive",
 )
 async def upload_file(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     metadata: str = Form(...),
     coverFile: Optional[UploadFile] = File(None),
     existingIdentifier: Optional[str] = Form(None),
@@ -69,7 +72,7 @@ async def upload_file(
     """
     Accepts multipart form data identical to the existing Next.js API route:
       - file:               The main media file
-      - metadata:           JSON string  { title, speaker?, media_type?, contentType? }
+      - metadata:           JSON string  { title, speaker? }
       - coverFile?:         Optional cover image
       - existingIdentifier?: Reuse an existing IA item
     """
@@ -91,61 +94,53 @@ async def upload_file(
 
         # Check if we have a file or if we're just updating an existing item
         has_main_file = False
+        has_cover_file = False
         try:
             if file and file.filename:
-                # Some starlette versions might not have .size or it might be None
-                # We check the spool file size if .size is missing
-                file_size = getattr(file, "size", None)
-                if file_size is None:
-                    file.file.seek(0, os.SEEK_END)
-                    file_size = file.file.tell()
-                    file.file.seek(0)
-                
-                if file_size > 0:
-                    has_main_file = True
+                has_main_file = upload_size(file) > 0
         except Exception as e:
             logger.warning("Error checking main file size: %s", e)
 
-        if not existingIdentifier and not has_main_file:
+        try:
+            if coverFile and coverFile.filename:
+                has_cover_file = upload_size(coverFile) > 0
+        except Exception as e:
+            logger.warning("Error checking cover file size: %s", e)
+
+        if not has_main_file and not (existingIdentifier and has_cover_file):
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                content={"error": "Missing file for new upload"}
+                content={"error": "Missing file for upload"}
             )
 
-        # Save to temp files so the IA library can read from disk
+        if existingIdentifier and not is_valid_identifier(existingIdentifier):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"error": "Invalid existingIdentifier"}
+            )
+
+        # Save to unique temp files so the IA library can read from disk.
         file_path = None
         cover_path = None
 
         try:
-            if has_main_file:
-                file_path = os.path.join(UPLOAD_DIR, file.filename or "upload")
-                with open(file_path, "wb") as f:
-                    shutil.copyfileobj(file.file, f)
-                logger.info("Saved temp main file: %s", file_path)
+            with upload_temp_dir() as temp_dir:
+                if has_main_file:
+                    file_path = save_upload_to_temp(file, "main-", temp_dir)
+                    logger.info("Saved temp main file: %s", file_path)
 
-            if coverFile and coverFile.filename:
-                cover_size = getattr(coverFile, "size", None)
-                if cover_size is None:
-                    coverFile.file.seek(0, os.SEEK_END)
-                    cover_size = coverFile.file.tell()
-                    coverFile.file.seek(0)
-                
-                if cover_size > 0:
-                    cover_path = os.path.join(UPLOAD_DIR, f"cover_{coverFile.filename}")
-                    with open(cover_path, "wb") as f:
-                        shutil.copyfileobj(coverFile.file, f)
+                if coverFile and coverFile.filename and has_cover_file:
+                    cover_path = save_upload_to_temp(coverFile, "cover-", temp_dir)
                     logger.info("Saved temp cover file: %s", cover_path)
 
-            result = upload_to_ia(
-                file_path=file_path,
-                original_filename=file.filename if file else "upload",
-                title=title,
-                content_type=meta.get("contentType"),
-                speaker=meta.get("speaker"),
-                media_type_subject=meta.get("media_type"),
-                cover_path=cover_path,
-                existing_identifier=existingIdentifier,
-            )
+                result = upload_to_ia(
+                    file_path=file_path,
+                    original_filename=file.filename if file else "upload",
+                    title=title,
+                    speaker=meta.get("speaker"),
+                    cover_path=cover_path,
+                    existing_identifier=existingIdentifier,
+                )
             return result
 
         except Exception as e:
@@ -158,11 +153,10 @@ async def upload_file(
         finally:
             # Clean up temp files
             for p in (file_path, cover_path):
-                if p and os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except OSError as e:
-                        logger.warning("Failed to remove temp file %s: %s", p, e)
+                try:
+                    remove_file_safely(p)
+                except OSError as e:
+                    logger.warning("Failed to remove temp file %s: %s", p, e)
 
     except Exception as e:
         logger.error("Global upload route error: %s", e)
@@ -186,9 +180,6 @@ async def update_item_metadata(
     ok = update_metadata(
         ia_url=body.ia_url,
         title=body.title,
-        speaker=body.speaker,
-        media_type_subject=body.media_type,
-        content_type=body.contentType,
     )
     if not ok:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Metadata update failed")
@@ -223,10 +214,10 @@ async def delete_ia_file(
     body: DeleteFileRequest,
     _api_key: str = Depends(verify_api_key),
 ):
-    ok = delete_file(body.ia_url)
-    if not ok:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "File deletion failed")
-    return StatusResponse(success=True, message="File deleted")
+    result = delete_file(body.ia_url)
+    if not result["success"]:
+        raise_operation_error(result, "File deletion failed")
+    return StatusResponse(**result)
 
 
 # ─── Delete item ─────────────────────────────────────────────────────────
@@ -234,16 +225,22 @@ async def delete_ia_file(
 @ia_router.delete(
     "/item",
     response_model=StatusResponse,
-    summary="Delete all files from an IA item",
+    summary="Remove an Internet Archive item",
 )
 async def delete_ia_item(
     body: DeleteItemRequest,
     _api_key: str = Depends(verify_api_key),
 ):
-    ok = delete_item(body.identifier)
-    if not ok:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Item deletion failed")
-    return StatusResponse(success=True, message="Item deleted")
+    if not body.confirm:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Set confirm=true to remove/deaccession this Internet Archive item",
+        )
+
+    result = delete_item(body.identifier)
+    if not result["success"]:
+        raise_operation_error(result, "Item deletion failed")
+    return StatusResponse(**result)
 
 
 # ─── Derive ──────────────────────────────────────────────────────────────
@@ -257,7 +254,7 @@ async def trigger_ia_derive(
     body: DeriveRequest,
     _api_key: str = Depends(verify_api_key),
 ):
-    ok = trigger_derive(body.identifier)
-    if not ok:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Derive trigger failed")
-    return StatusResponse(success=True, message="Derive triggered")
+    result = trigger_derive(body.identifier)
+    if not result["success"]:
+        raise_operation_error(result, "Derive trigger failed")
+    return StatusResponse(**result)

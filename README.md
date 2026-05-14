@@ -41,7 +41,7 @@ All endpoints require `Authorization: Bearer <API_SECRET_KEY>` header.
 | `PATCH`  | `/api/ia/metadata`| Update item metadata             |
 | `POST`   | `/api/ia/rename`  | Rename a file in an IA item      |
 | `DELETE` | `/api/ia/file`    | Delete a single file             |
-| `DELETE` | `/api/ia/item`    | Delete all files in an item      |
+| `DELETE` | `/api/ia/item`    | Remove/deaccession an IA item    |
 | `POST`   | `/api/ia/derive`  | Trigger IA derive                |
 | `GET`    | `/health`         | Health check                     |
 
@@ -51,22 +51,36 @@ POST /api/ia/upload
 Content-Type: multipart/form-data
 
 Fields:
-  file:                Main media file
-  metadata:            JSON string { title, speaker?, media_type?, contentType? }
+  file?:               Main media file (required for new items)
+  metadata:            JSON string { title, speaker? }
   coverFile?:          Optional cover image
   existingIdentifier?: Reuse an existing IA item
 ```
+
+Upload responses include `deriveTriggered`, optional derive task details, and
+`warnings` when a non-fatal step such as cover upload or derive submission fails.
 
 ### Metadata Update
 ```json
 PATCH /api/ia/metadata
 {
   "ia_url": "ia://fikreislam-speaker-abc123/file.mp3",
-  "title": "New Title",
-  "speaker": "Speaker Name",
-  "contentType": "آڈیو"
+  "title": "New Title"
 }
 ```
+
+### Item Removal
+```json
+DELETE /api/ia/item
+{
+  "identifier": "fikreislam-speaker-abc123",
+  "confirm": true
+}
+```
+
+The item endpoint submits Internet Archive's remove/deaccession task. Invalid
+identifiers are rejected before contacting IA, and successful responses include
+task status details when available.
 
 ## Environment Variables
 
@@ -89,6 +103,8 @@ fikreislam-backend/
 │   ├── auth.py           # Bearer token verification
 │   ├── schemas.py        # Pydantic request/response models
 │   ├── ia_service.py     # Core IA operations (official library)
+│   ├── ia_helpers.py     # IA validation, parsing, sessions, task retries
+│   ├── route_helpers.py  # Upload temp files and route error helpers
 │   └── routes.py         # API endpoints
 ├── requirements.txt
 ├── run.py               # Uvicorn entry point

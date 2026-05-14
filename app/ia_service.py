@@ -10,74 +10,112 @@ from __future__ import annotations
 
 import logging
 import os
-import re
-import uuid
 from typing import Optional
 from urllib.parse import quote
 
 import internetarchive as ia
 
 from app.config import settings
-from app.schemas import CONTENT_TYPE_TO_MEDIATYPE
+from app.ia_helpers import (
+    extract_identifier,
+    extract_identifier_and_filename,
+    generate_identifier,
+    get_session,
+    is_valid_identifier,
+    response_text,
+    sanitize_filename,
+    submit_task_with_retry,
+)
 
 logger = logging.getLogger("fikreislam-ia.service")
 
-
-# ─── Helpers ─────────────────────────────────────────────────────────────
-
-def _get_session() -> ia.ArchiveSession:
-    """Create an authenticated IA session from env credentials."""
-    settings.validate_ia_credentials()
-    config = {
-        "s3": {
-            "access": settings.ia_access_key,
-            "secret": settings.ia_secret_key,
-        }
-    }
-    return ia.get_session(config=config)
+IA_UPLOAD_HEADERS = {
+    "x-archive-interactive-priority": "1",
+    "x-archive-keep-old-version": "0",
+    "x-archive-queue-derive": "0",
+}
 
 
-def sanitize_filename(name: str) -> str:
-    """Match the TypeScript sanitizeFileName behaviour."""
-    name = re.sub(r"\s+", "_", name)
-    # Keep word chars, dots, hyphens, and Arabic/Urdu characters
-    name = re.sub(r"[^\w.\-\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]", "_", name)
-    name = re.sub(r"_+", "_", name)
-    return name
+def _has_file(path: str | None) -> bool:
+    return bool(path and os.path.exists(path) and os.path.getsize(path) > 0)
 
 
-def generate_identifier(speaker_slug: Optional[str] = None) -> str:
-    """Generate a unique IA item identifier (mirrors TS generateItemIdentifier)."""
-    short_id = uuid.uuid4().hex[:10]
-    if speaker_slug:
-        # Strictly ASCII for the identifier bucket name
-        slug = re.sub(r"[^a-zA-Z0-9\s-]", "", speaker_slug)
-        slug = re.sub(r"\s+", "-", slug)
-        slug = re.sub(r"-+", "-", slug)
-        slug = slug.lower().strip("-")[:40]
-        if len(slug) >= 3:
-            return f"fikreislam-{slug}-{short_id}"
-    return f"fikreislam-media-{short_id}"
+def _upload_main_file(
+    identifier: str,
+    file_path: str,
+    safe_filename: str,
+    metadata: dict,
+) -> tuple[str, str]:
+    responses = ia.upload(
+        identifier,
+        files={safe_filename: file_path},
+        metadata=metadata,
+        access_key=settings.ia_access_key,
+        secret_key=settings.ia_secret_key,
+        queue_derive=False,
+        retries=3,
+        retries_sleep=2,
+        headers=IA_UPLOAD_HEADERS,
+    )
+
+    for resp in responses:
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"IA upload failed ({resp.status_code}): {resp.text[:500]}")
+
+    logger.info("Uploaded main file: %s → %s", safe_filename, identifier)
+    return (
+        f"ia://{identifier}/{safe_filename}",
+        f"https://archive.org/download/{identifier}/{quote(safe_filename)}",
+    )
 
 
-def extract_identifier(url: str | None) -> str | None:
-    """Extract an IA identifier from ia://, download, or details URLs."""
-    if not url:
-        return None
-    if url.startswith("ia://"):
-        return url.replace("ia://", "").split("/")[0]
-    if "archive.org/download/" in url:
-        return url.split("archive.org/download/")[1].split("/")[0]
-    if "archive.org/details/" in url:
-        return url.split("archive.org/details/")[1].split("/")[0]
-    return None
+def _upload_cover_file(identifier: str, cover_path: str) -> tuple[str | None, list[str]]:
+    warnings: list[str] = []
+    cover_ext = os.path.splitext(cover_path)[1] or ".jpg"
+    cover_remote = f"cover{cover_ext}"
+
+    try:
+        logger.info("Starting cover upload for %s: %s", identifier, cover_remote)
+        responses = ia.upload(
+            identifier,
+            files={cover_remote: cover_path},
+            access_key=settings.ia_access_key,
+            secret_key=settings.ia_secret_key,
+            queue_derive=False,
+            retries=2,
+            retries_sleep=2,
+            headers=IA_UPLOAD_HEADERS,
+        )
+        for resp in responses:
+            if resp.status_code in (200, 201):
+                logger.info("Uploaded cover successfully: %s → %s", cover_remote, identifier)
+                return f"ia://{identifier}/{cover_remote}", warnings
+
+            warning = f"Cover upload failed ({resp.status_code})"
+            warnings.append(warning)
+            logger.warning("%s for %s: %s", warning, identifier, response_text(resp))
+    except Exception as e:
+        warning = f"Cover upload failed: {e}"
+        warnings.append(warning)
+        logger.warning("Cover upload non-fatal error: %s", e)
+
+    return None, warnings
 
 
-def _resolve_mediatype(content_type: str | None) -> str:
-    """Map Urdu content type to IA mediatype string."""
-    if content_type and content_type in CONTENT_TYPE_TO_MEDIATYPE:
-        return CONTENT_TYPE_TO_MEDIATYPE[content_type]
-    return "audio"
+def _derive_upload(identifier: str) -> tuple[bool, int | None, str | None, list[str]]:
+    logger.info("Triggering derive task for %s...", identifier)
+    result = trigger_derive(identifier)
+    derive_triggered = result["success"]
+    if derive_triggered:
+        logger.info("Derive task triggered for %s", identifier)
+    else:
+        logger.warning("Upload succeeded but derive did not trigger for %s", identifier)
+    return (
+        derive_triggered,
+        result.get("taskStatusCode"),
+        result.get("taskResponse"),
+        result.get("warnings", []),
+    )
 
 
 # ─── Upload ──────────────────────────────────────────────────────────────
@@ -86,9 +124,7 @@ def upload_to_ia(
     file_path: Optional[str],
     original_filename: str,
     title: str,
-    content_type: str | None = None,
     speaker: str | None = None,
-    media_type_subject: str | None = None,
     cover_path: str | None = None,
     existing_identifier: str | None = None,
 ) -> dict:
@@ -103,12 +139,12 @@ def upload_to_ia(
     Returns the same shape as the TS IAUploadResult.
     """
     identifier = existing_identifier or generate_identifier(speaker)
-    safe_filename = sanitize_filename(original_filename)
-    mediatype = _resolve_mediatype(content_type)
+    if not is_valid_identifier(identifier):
+        raise RuntimeError("Invalid Internet Archive identifier")
 
+    safe_filename = sanitize_filename(original_filename)
+    warnings: list[str] = []
     metadata = {
-        "mediatype": mediatype,
-        "collection": "opensource",
         "title": title,
         "creator": "فکر اسلام",
     }
@@ -116,38 +152,14 @@ def upload_to_ia(
     ia_url = ""
     download_url = ""
 
-    # Upload main file
-    if file_path and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-        # Prepare file dict with remote name as key
-        files = {safe_filename: file_path}
-
+    if _has_file(file_path):
         try:
-            responses = ia.upload(
+            ia_url, download_url = _upload_main_file(
                 identifier,
-                files=files,
-                metadata=metadata,
-                access_key=settings.ia_access_key,
-                secret_key=settings.ia_secret_key,
-                queue_derive=False,
-                retries=3,
-                retries_sleep=2,
-                headers={
-                    "x-archive-interactive-priority": "1",
-                    "x-archive-keep-old-version": "0",
-                    "x-archive-queue-derive": "0",
-                },
+                file_path,
+                safe_filename,
+                metadata,
             )
-
-            # Check for errors
-            for resp in responses:
-                if resp.status_code not in (200, 201):
-                    raise RuntimeError(
-                        f"IA upload failed ({resp.status_code}): {resp.text[:500]}"
-                    )
-            
-            ia_url = f"ia://{identifier}/{safe_filename}"
-            download_url = f"https://archive.org/download/{identifier}/{quote(safe_filename)}"
-            logger.info("Uploaded main file: %s → %s", safe_filename, identifier)
         except Exception as e:
             logger.error("Main file upload failed for %s: %s", identifier, e)
             raise RuntimeError(f"Internet Archive upload failed: {str(e)}")
@@ -156,46 +168,41 @@ def upload_to_ia(
 
     # Upload cover image
     cover_ia_url = None
-    if cover_path and os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-        try:
-            cover_ext = os.path.splitext(cover_path)[1] or ".jpg"
-            cover_remote = f"cover{cover_ext}"
-            cover_files = {cover_remote: cover_path}
-            logger.info("Starting cover upload for %s: %s", identifier, cover_remote)
-
-            cover_responses = ia.upload(
-                identifier,
-                files=cover_files,
-                access_key=settings.ia_access_key,
-                secret_key=settings.ia_secret_key,
-                queue_derive=False,
-                retries=2,
-                retries_sleep=2,
-                headers={
-                    "x-archive-interactive-priority": "1",
-                    "x-archive-keep-old-version": "0",
-                    "x-archive-queue-derive": "0",
-                },
-            )
-            for resp in cover_responses:
-                if resp.status_code in (200, 201):
-                    cover_ia_url = f"ia://{identifier}/{cover_remote}"
-                    logger.info("Uploaded cover successfully: %s → %s", cover_remote, identifier)
-        except Exception as e:
-            logger.warning("Cover upload non-fatal error: %s", e)
+    if _has_file(cover_path):
+        cover_ia_url, cover_warnings = _upload_cover_file(identifier, cover_path)
+        warnings.extend(cover_warnings)
 
     # Trigger a derive task to ensure thumbnails and player assets are updated
-    if (file_path and os.path.exists(file_path)) or cover_ia_url:
-        logger.info("Triggering derive task for %s...", identifier)
-        trigger_derive(identifier)
-        logger.info("Derive task triggered for %s", identifier)
+    derive_triggered = False
+    derive_task_status_code = None
+    derive_task_response = None
+    if _has_file(file_path) or cover_ia_url:
+        (
+            derive_triggered,
+            derive_task_status_code,
+            derive_task_response,
+            derive_warnings,
+        ) = _derive_upload(identifier)
+        warnings.extend(derive_warnings)
 
+    logger.info(
+        "audit action=upload identifier=%s file=%s cover_uploaded=%s derive_triggered=%s warnings=%d",
+        identifier,
+        safe_filename,
+        bool(cover_ia_url),
+        derive_triggered,
+        len(warnings),
+    )
     return {
         "identifier": identifier,
         "fileName": safe_filename,
         "iaUrl": ia_url,
         "downloadUrl": download_url,
         "coverIaUrl": cover_ia_url,
+        "deriveTriggered": derive_triggered,
+        "deriveTaskStatusCode": derive_task_status_code,
+        "deriveTaskResponse": derive_task_response,
+        "warnings": warnings,
     }
 
 
@@ -204,19 +211,13 @@ def upload_to_ia(
 def update_metadata(
     ia_url: str,
     title: str | None = None,
-    speaker: str | None = None,
-    media_type_subject: str | None = None,
-    content_type: str | None = None,
 ) -> bool:
     """Update item metadata using official modify_metadata (JSON Patch)."""
     identifier = extract_identifier(ia_url)
-    if not identifier:
+    if not is_valid_identifier(identifier):
         return False
 
-    mediatype = _resolve_mediatype(content_type)
-
     md: dict = {
-        "mediatype": mediatype,
         "creator": "فکر اسلام"
     }
     if title:
@@ -253,16 +254,9 @@ def rename_file(ia_url: str, new_title: str) -> dict | None:
     since the library doesn't expose copy natively — we fall back to
     session-based raw copy.
     """
-    if not ia_url or not ia_url.startswith("ia://"):
+    identifier, old_filename = extract_identifier_and_filename(ia_url)
+    if not identifier or not old_filename:
         return None
-
-    path = ia_url.replace("ia://", "")
-    parts = path.split("/")
-    if len(parts) < 2:
-        return None
-
-    identifier = parts[0]
-    old_filename = parts[1]
     ext = old_filename.rsplit(".", 1)[-1] if "." in old_filename else ""
     new_filename = f"{sanitize_filename(new_title)}.{ext}" if ext else sanitize_filename(new_title)
 
@@ -273,7 +267,7 @@ def rename_file(ia_url: str, new_title: str) -> dict | None:
         }
 
     try:
-        session = _get_session()
+        session = get_session()
         # Use S3 copy (PUT with x-amz-copy-source header)
         copy_url = f"https://s3.us.archive.org/{identifier}/{quote(new_filename)}"
         copy_source = f"/{identifier}/{quote(old_filename)}"
@@ -295,13 +289,17 @@ def rename_file(ia_url: str, new_title: str) -> dict | None:
             return None
 
         # Delete old file
-        delete_file(ia_url)
+        delete_result = delete_file(ia_url)
+        warnings = delete_result.get("warnings", [])
 
         logger.info("Renamed %s → %s in %s", old_filename, new_filename, identifier)
-        trigger_derive(identifier)
+        derive_result = trigger_derive(identifier)
+        warnings.extend(derive_result.get("warnings", []))
         return {
             "iaUrl": f"ia://{identifier}/{new_filename}",
             "downloadUrl": f"https://archive.org/download/{identifier}/{quote(new_filename)}",
+            "deriveTriggered": derive_result["success"],
+            "warnings": warnings,
         }
     except Exception as e:
         logger.error("Error renaming file in %s: %s", identifier, e)
@@ -310,86 +308,91 @@ def rename_file(ia_url: str, new_title: str) -> dict | None:
 
 # ─── Delete file ─────────────────────────────────────────────────────────
 
-def delete_file(ia_url: str) -> bool:
+def delete_file(ia_url: str) -> dict:
     """Delete a single file from an IA item."""
-    if not ia_url or not ia_url.startswith("ia://"):
-        return False
-
-    path = ia_url.replace("ia://", "")
-    slash_idx = path.index("/") if "/" in path else -1
-    if slash_idx == -1:
-        return False
-
-    identifier = path[:slash_idx]
-    filename = path[slash_idx + 1:]
+    identifier, filename = extract_identifier_and_filename(ia_url)
+    if not identifier or not filename:
+        return {
+            "success": False,
+            "message": "Invalid Internet Archive file URL",
+            "warnings": ["Invalid Internet Archive file URL"],
+        }
 
     try:
-        ia.delete(
+        resp = ia.delete(
             identifier,
             files=[filename],
             access_key=settings.ia_access_key,
             secret_key=settings.ia_secret_key,
         )
         logger.info("Deleted file %s from %s", filename, identifier)
-        trigger_derive(identifier)
-        return True
+        derive_result = trigger_derive(identifier)
+        logger.info(
+            "audit action=delete_file identifier=%s file=%s derive_triggered=%s warnings=%d",
+            identifier,
+            filename,
+            derive_result["success"],
+            len(derive_result.get("warnings", [])),
+        )
+        return {
+            "success": True,
+            "identifier": identifier,
+            "fileName": filename,
+            "message": "File deleted",
+            "deleteResponse": response_text(resp),
+            "deriveTriggered": derive_result["success"],
+            "warnings": derive_result.get("warnings", []),
+        }
     except Exception as e:
         logger.error("Error deleting file %s from %s: %s", filename, identifier, e)
-        return False
+        return {
+            "success": False,
+            "identifier": identifier,
+            "fileName": filename,
+            "message": "File deletion failed",
+            "warnings": [str(e)],
+        }
 
 
 # ─── Delete entire item ─────────────────────────────────────────────────
 
 
-def delete_item(identifier: str) -> bool:
-    """Fully remove an IA item (matches the web UI "Remove Items" button).
+def delete_item(identifier: str) -> dict:
+    """Remove/deaccession an IA item (matches the web UI "Remove Items" button).
 
     Submits a ``make_dark.php`` task — this is the same mechanism the
     archive.org web UI uses to deaccession an item and remove it from
     uploads, search results, and public listings.
     """
-    if not identifier:
-        return False
-
-    try:
-        session = _get_session()
-        resp = session.submit_task(
+    result = submit_task_with_retry(
+        identifier,
+        cmd="make_dark.php",
+        comment="remove item via fikreislam backend",
+    )
+    if result["success"]:
+        logger.info("make_dark task submitted for %s — item will be removed from uploads", identifier)
+        logger.info(
+            "audit action=delete_item identifier=%s task_status=%s",
             identifier,
-            cmd="make_dark.php",
-            comment="remove item via fikreislam backend",
+            result.get("taskStatusCode"),
         )
-        if resp.status_code in (200, 201):
-            logger.info("make_dark task submitted for %s — item will be removed from uploads", identifier)
-            return True
-        else:
-            logger.warning(
-                "make_dark task returned %d for %s: %s",
-                resp.status_code, identifier, getattr(resp, 'text', '')[:300],
-            )
-            return False
-    except Exception as e:
-        logger.error("Error submitting make_dark task for item %s: %s", identifier, e)
-        return False
+        result["message"] = "Item removal task submitted"
+    return result
 
 
 # ─── Trigger derive ─────────────────────────────────────────────────────
 
-def trigger_derive(identifier: str) -> bool:
+def trigger_derive(identifier: str) -> dict:
     """Submit a derive task for the item."""
-    if not identifier:
-        return False
-
-    try:
-        session = _get_session()
-        resp = session.submit_task(
-            identifier,
-            cmd="derive.php",
-            comment="force derive via fikreislam backend",
-        )
-        ok = resp.status_code in (200, 201)
-        if ok:
-            logger.info("Derive triggered for %s", identifier)
-        return ok
-    except Exception as e:
-        logger.error("Error triggering derive for %s: %s", identifier, e)
-        return False
+    result = submit_task_with_retry(
+        identifier,
+        cmd="derive.php",
+        comment="force derive via fikreislam backend",
+        attempts=2,
+    )
+    if result["success"]:
+        logger.info("Derive triggered for %s", identifier)
+        result["message"] = "Derive triggered"
+    else:
+        logger.error("Error triggering derive for %s: %s", identifier, result.get("message"))
+    return result
