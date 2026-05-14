@@ -15,7 +15,7 @@ class UploadMetadata(BaseModel):
 
     title: str
     speaker: Optional[str] = None
-    contentType: Optional[Literal["آڈیو", "ویڈیو", "book"]] = "آڈیو"
+    contentType: Optional[Literal["آڈیو", "ویڈیو", "کتاب"]] = "آڈیو"
 
 
 class UpdateMetadataRequest(BaseModel):
@@ -23,7 +23,7 @@ class UpdateMetadataRequest(BaseModel):
 
     ia_url: str = Field(..., description="ia:// URL or archive.org URL")
     title: Optional[str] = None
-    contentType: Optional[Literal["آڈیو", "ویڈیو", "book"]] = None
+    contentType: Optional[Literal["آڈیو", "ویڈیو", "کتاب"]] = None
 
 
 class RenameRequest(BaseModel):

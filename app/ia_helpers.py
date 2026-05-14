@@ -21,7 +21,7 @@ IDENTIFIER_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{2,99}$")
 CONTENT_TYPE_TO_MEDIATYPE = {
     "آڈیو": "audio",
     "ویڈیو": "movies",
-    "book": "texts",
+    "کتاب": "texts",
 }
 
 
